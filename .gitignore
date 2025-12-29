@@ -1,1 +1,6 @@
+# OAuth credentials (DO NOT COMMIT)
+client_secret.json
+token.json
+
+# Legacy service account (if still present)
 credentials.json
