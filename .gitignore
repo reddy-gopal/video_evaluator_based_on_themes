@@ -2,5 +2,9 @@
 client_secret.json
 token.json
 
+# Environment variables (DO NOT COMMIT)
+.env
+
 # Legacy service account (if still present)
 credentials.json
+.env

@@ -3,10 +3,12 @@ import re
 import json
 import tempfile
 import io
+import time
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timezone
 
 import cv2
+from dotenv import load_dotenv
 
 from google import genai
 from google.genai import types
@@ -17,18 +19,30 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+# Load environment variables from .env file
+load_dotenv()
+
 
 # =========================
 # CONFIG
 # =========================
-GEMINI_API_KEY = "AIzaSyABjMXV9tnPZVrYorXVc2Zcd5-XEiOFWUY"
+# Get Gemini API key from .env file
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise ValueError(
+        "❌ Gemini API key not found!\n\n"
+        "Please create a .env file in the project root with:\n"
+        "GEMINI_API_KEY=your_api_key_here\n\n"
+        "Get your API key from: https://aistudio.google.com/app/apikey"
+    )
+
 MODEL_NAME = "gemini-2.5-flash"
 
 GOOGLE_SHEET_URL = input("Enter the Google Sheet URL: ")
 CLIENT_SECRETS_FILE = "client_secret.json"
 TOKEN_FILE = "token.json"
 
-BATCH_SIZE = 5
+BATCH_SIZE = None  # Set to None to process all rows, or set a number to limit rows per run
 EXTRACT_EVERY_SEC = 1.0
 MAX_FRAMES_TO_SEND = 10
 RESIZE_MAX_SIDE = 768
@@ -248,7 +262,11 @@ def extract_file_id_from_url(drive_url: str) -> str:
     raise ValueError(f"Could not extract file ID from URL: {drive_url}")
 
 def download_drive_video(drive_url: str, out_path: str) -> str:
-    """Download video from Google Drive using service account credentials."""
+    """Download video from Google Drive using OAuth credentials."""
+    # Validate URL is not empty
+    if not drive_url or not drive_url.strip():
+        raise ValueError("Drive URL is empty or undefined")
+    
     try:
         # Extract file ID from URL
         file_id = extract_file_id_from_url(drive_url)
@@ -314,14 +332,32 @@ def download_drive_video(drive_url: str, out_path: str) -> str:
 def video_to_frames(video_path: str, output_dir: str, every_sec: float) -> List[str]:
     os.makedirs(output_dir, exist_ok=True)
 
+    # Check if file exists and has content
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    
+    file_size = os.path.getsize(video_path)
+    if file_size == 0:
+        raise RuntimeError(f"Video file is empty (0 bytes): {video_path}")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise FileNotFoundError(f"Could not open video: {video_path}")
+        raise RuntimeError(
+            f"Could not open video file: {video_path}\n"
+            f"This usually means:\n"
+            f"1. The file is corrupted or incomplete (file size: {file_size} bytes)\n"
+            f"2. The file format is not supported\n"
+            f"3. The download was incomplete\n"
+            f"Try re-downloading the file or check if it's a valid video file."
+        )
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
         cap.release()
-        raise RuntimeError("Could not read FPS from video.")
+        raise RuntimeError(
+            f"Could not read FPS from video: {video_path}\n"
+            f"The file may be corrupted or in an unsupported format."
+        )
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_sec = frame_count / fps if fps else 0
@@ -415,42 +451,97 @@ Example:
 
     contents = img_parts + [prompt]
 
-    resp = gemini_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    # Retry logic: 6 attempts
+    MAX_RETRIES = 6
+    last_error = None
+    api_key_error = False
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = gemini_client.models.generate_content(
+                model=MODEL_NAME,
+                contents=contents,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            
+            # Success - parse the response
+            raw = resp.text or ""
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                m = re.search(r"\{.*\}", raw, flags=re.S)
+                if not m:
+                    if attempt < MAX_RETRIES:
+                        print(f"⚠️  Attempt {attempt}/{MAX_RETRIES}: Invalid JSON response, retrying...")
+                        time.sleep(2)  # Wait 2 seconds before retry
+                        continue
+                    raise RuntimeError(f"Gemini did not return valid JSON after {MAX_RETRIES} attempts. Raw: {raw}")
+                data = json.loads(m.group(0))
+
+            best_theme = str(data.get("best_theme", "")).strip()
+            if best_theme not in THEMES:
+                if attempt < MAX_RETRIES:
+                    print(f"⚠️  Attempt {attempt}/{MAX_RETRIES}: Invalid theme returned, retrying...")
+                    time.sleep(2)
+                    continue
+                raise RuntimeError(f'Invalid best_theme returned after {MAX_RETRIES} attempts: "{best_theme}"')
+
+            criteria = data.get("evaluation_criteria", {})
+            if not isinstance(criteria, dict):
+                criteria = {}
+
+            # Success - return the result
+            return {
+                "best_theme": best_theme,
+                "match_score": int(data.get("match_score", 0)),
+                "feedback": str(data.get("feedback", "")).strip(),
+                "evaluation_criteria": {
+                    "relevance": int(criteria.get("relevance", 0)),
+                    "visual_quality": int(criteria.get("visual_quality", 0)),
+                    "creativity": int(criteria.get("creativity", 0)),
+                    "technical_execution": int(criteria.get("technical_execution", 0)),
+                    "engagement_potential": int(criteria.get("engagement_potential", 0)),
+                }
+            }
+            
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            
+            # Check if it's an API key error
+            if "403" in error_str or "PERMISSION_DENIED" in error_str or "API key" in error_str.lower() or "leaked" in error_str.lower() or "401" in error_str or "UNAUTHENTICATED" in error_str:
+                api_key_error = True
+                if attempt < MAX_RETRIES:
+                    print(f"⚠️  Attempt {attempt}/{MAX_RETRIES}: API key error, retrying...")
+                    time.sleep(2)
+                    continue
+                # After 6 attempts with API key error
+                raise RuntimeError(
+                    f"❌ Gemini API Key Error - Failed after {MAX_RETRIES} attempts\n\n"
+                    f"Your API key appears to be invalid, expired, or has been reported as leaked.\n\n"
+                    f"SOLUTION - Please change your API key:\n"
+                    f"1. Get a new API key from: https://aistudio.google.com/app/apikey\n"
+                    f"2. Update your .env file with: GEMINI_API_KEY=your_new_key\n"
+                    f"3. Make sure to keep your API key secret - never commit it to version control\n\n"
+                    f"Original error: {error_str}"
+                )
+            else:
+                # Other errors - retry
+                if attempt < MAX_RETRIES:
+                    print(f"⚠️  Attempt {attempt}/{MAX_RETRIES}: Error occurred, retrying... ({error_str[:100]})")
+                    time.sleep(2)
+                    continue
+    
+    # If we get here, all 6 attempts failed with non-API-key errors
+    raise RuntimeError(
+        f"❌ Gemini API Error - Failed after {MAX_RETRIES} attempts\n\n"
+        f"Unable to process the video after {MAX_RETRIES} retry attempts.\n\n"
+        f"If this persists, please check:\n"
+        f"1. Your API key is valid: https://aistudio.google.com/app/apikey\n"
+        f"2. You have sufficient API quota\n"
+        f"3. Your internet connection is stable\n\n"
+        f"Last error: {str(last_error)}"
     )
-
-    raw = resp.text or ""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, flags=re.S)
-        if not m:
-            raise RuntimeError(f"Gemini did not return valid JSON. Raw: {raw}")
-        data = json.loads(m.group(0))
-
-    best_theme = str(data.get("best_theme", "")).strip()
-    if best_theme not in THEMES:
-        # hard fail to avoid writing garbage into sheet
-        raise RuntimeError(f'Invalid best_theme returned: "{best_theme}"')
-
-    criteria = data.get("evaluation_criteria", {})
-    if not isinstance(criteria, dict):
-        criteria = {}
-
-    return {
-        "best_theme": best_theme,
-        "match_score": int(data.get("match_score", 0)),
-        "feedback": str(data.get("feedback", "")).strip(),
-        "evaluation_criteria": {
-            "relevance": int(criteria.get("relevance", 0)),
-            "visual_quality": int(criteria.get("visual_quality", 0)),
-            "creativity": int(criteria.get("creativity", 0)),
-            "technical_execution": int(criteria.get("technical_execution", 0)),
-            "engagement_potential": int(criteria.get("engagement_potential", 0)),
-        }
-    }
 
 
 # =========================
@@ -552,19 +643,20 @@ def main():
             raise RuntimeError(
                 f"Permission denied accessing Google Sheet.\n"
                 f"This usually means:\n"
-                f"1. The service account email doesn't have access to the sheet\n"
-                f"2. The credentials.json file is incorrect or outdated\n"
-                f"3. The sheet hasn't been shared with the service account\n\n"
+                f"1. The Gmail account you signed in with doesn't have access to the sheet\n"
+                f"2. The token.json file is incorrect or outdated\n"
+                f"3. The sheet hasn't been shared with your Gmail account\n\n"
                 f"To fix:\n"
-                f"- Share your Google Sheet with the service account email (Editor access)\n"
-                f"- Verify credentials.json is the correct file\n"
+                f"- Share your Google Sheet with your Gmail account (Editor access)\n"
+                f"- Delete token.json and run the script again to re-authorize\n"
+                f"- Make sure you sign in with the correct Gmail account\n"
                 f"- Original error: {error_msg}"
             )
         else:
             raise RuntimeError(f"Failed to read Google Sheet: {error_msg}")
     
     if not headers:
-        raise RuntimeError("Header row (Row 1) is empty. Add headers like: Id, Drive Link, match_score, feedback, status, processed_at")
+        raise RuntimeError("Header row (Row 1) is empty. Add headers like: Id, Drive Link, final_score, feedback, status, processed_at")
 
     hmap = build_header_map(headers)
     
@@ -573,7 +665,7 @@ def main():
     print(f"Found headers: {', '.join(found_headers)}")
 
     # Required headers (theme is OPTIONAL now; if present, we'll write best_theme into it)
-    required = ["id", "drive_link", "match_score", "feedback", "status", "processed_at"]
+    required = ["id", "drive_link", "final_score", "feedback", "status", "processed_at"]
     missing = [r for r in required if r not in hmap]
     if missing:
         raise RuntimeError(
@@ -586,7 +678,7 @@ def main():
 
     id_col = hmap["id"]
     drive_col = hmap["drive_link"]
-    score_col = hmap["match_score"]
+    score_col = hmap["final_score"]
     feedback_col = hmap["feedback"]
     status_col = hmap["status"]
     ts_col = hmap["processed_at"]
@@ -620,18 +712,60 @@ def main():
     processed_count = 0
 
     for sheet_row_num, r in enumerate(rows, start=2):
-        if processed_count >= BATCH_SIZE:
+        # Check batch size limit (if set)
+        if BATCH_SIZE is not None and processed_count >= BATCH_SIZE:
+            print(f"Reached batch size limit ({BATCH_SIZE}). Stopping.")
             break
 
         row_id = safe_int(r[id_col]) if len(r) > id_col else None
         drive_link = r[drive_col].strip() if len(r) > drive_col else ""
+        existing_status = r[status_col].strip() if len(r) > status_col else ""
 
         # Skip rows without an Id
         if row_id is None:
             continue
         
+        # Skip rows that are already processed (status is DONE or ERROR)
+        status_upper = existing_status.upper()
+        if status_upper == "DONE":
+            print(f"SKIP | Id={row_id} | Already processed (status: DONE)")
+            continue
+        if status_upper == "ERROR":
+            print(f"SKIP | Id={row_id} | Skipping error row (status: ERROR)")
+            continue
+        
         # Skip rows with empty drive links
         if not drive_link:
+            print(f"SKIP | Id={row_id} | Empty or undefined drive link")
+            continue
+
+        # Validate URL format before processing
+        try:
+            # Try to extract file ID to validate URL format
+            extract_file_id_from_url(drive_link)
+        except ValueError as url_error:
+            # Invalid URL format - mark as error and continue
+            ts = datetime.now(timezone.utc).isoformat()
+            feedback_a1 = col_to_a1(feedback_col)
+            ts_a1 = col_to_a1(ts_col)
+            status_a1 = col_to_a1(status_col)
+            
+            updates.extend([
+                {"range": f"{sheet_name}!{feedback_a1}{sheet_row_num}:{feedback_a1}{sheet_row_num}",
+                 "values": [[f"Invalid Drive URL format: {str(url_error)[:150]}"]]},
+                {"range": f"{sheet_name}!{status_a1}{sheet_row_num}:{status_a1}{sheet_row_num}",
+                 "values": [["ERROR"]]},
+                {"range": f"{sheet_name}!{ts_a1}{sheet_row_num}:{ts_a1}{sheet_row_num}",
+                 "values": [[ts]]},
+            ])
+            
+            print(f"ERROR | Id={row_id} | Invalid Drive URL: {str(url_error)}")
+            processed_count += 1
+            
+            if len(updates) >= 20:
+                batch_update(spreadsheet_id, updates)
+                updates = []
+            
             continue
 
         status_a1 = col_to_a1(status_col)

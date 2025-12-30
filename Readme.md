@@ -27,7 +27,7 @@ The script stores the video + frames in a **temporary folder** and deletes them 
 ### 1. Python Packages
 Install required packages:
 ```bash
-pip install opencv-python google-genai google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+pip install opencv-python google-genai google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client python-dotenv
 ```
 
 **Note:** We removed `gdown` since we're now using Google Drive API directly with OAuth authentication.
@@ -159,10 +159,18 @@ If students have uploaded videos to Google Drive:
 
 ## Project Configuration
 
-### Step 1: Update API Key
-Edit `index.py` and update:
-```python
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+### Step 1: Create .env File with API Key
+1. Create a file named `.env` in the project root directory (same folder as `index.py`)
+2. Add your Gemini API key to the file:
+   ```
+   GEMINI_API_KEY=your_api_key_here
+   ```
+3. Get your API key from: https://aistudio.google.com/app/apikey
+4. **Important:** Never commit `.env` to version control (it's already in `.gitignore`)
+
+**Example .env file:**
+```
+GEMINI_API_KEY=AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ```
 
 ### Step 2: Verify OAuth Files
@@ -278,10 +286,11 @@ This means the Gmail account you signed in with cannot see the files.
 ```
 Task6/
 ├── index.py              # Main script
+├── .env                  # Environment variables with API key (DO NOT COMMIT)
 ├── client_secret.json    # OAuth client secrets (DO NOT COMMIT)
 ├── token.json           # OAuth token (auto-generated, DO NOT COMMIT)
 ├── Readme.md            # This file
-└── .gitignore           # Should include client_secret.json and token.json
+└── .gitignore           # Should include .env, client_secret.json and token.json
 ```
 
 ---
